@@ -12,6 +12,8 @@ from diffusion_policy.model.common.module_attr_mixin import ModuleAttrMixin
 
 from diffusion_policy.common.pytorch_util import replace_submodules
 
+from .moe_blocks import replace_vit_blocks_with_moe  # 放在文件开头import
+
 logger = logging.getLogger(__name__)
 
 class AttentionPool2d(nn.Module):
@@ -87,6 +89,10 @@ class TransformerObsEncoder(ModuleAttrMixin):
             num_classes=0            # remove classification layer
         )
         self.model_name = model_name
+        
+        if model_name.startswith('vit'):
+            moe_layers = [8, 9, 10, 11]  # 或你需要的层号
+            model = replace_vit_blocks_with_moe(model, moe_layers, adapter_dim=192, num_experts=4)
 
         if frozen:
             assert pretrained
