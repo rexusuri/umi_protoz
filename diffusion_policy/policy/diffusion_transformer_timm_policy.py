@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
@@ -20,6 +21,8 @@ class DiffusionTransformerTimmPolicy(BaseImagePolicy):
             obs_encoder: TransformerObsEncoder,
             num_inference_steps=None,
             input_pertub=0.1,
+            use_dpm_solver: bool = False,
+            dpm_solver_order: int = 2,
             # arch
             n_layer=7,
             n_head=8,
@@ -58,6 +61,8 @@ class DiffusionTransformerTimmPolicy(BaseImagePolicy):
         self.action_horizon = action_horizon
         self.input_pertub = input_pertub
         self.kwargs = kwargs
+        self.use_dpm_solver = use_dpm_solver
+        self.dpm_solver_order = dpm_solver_order
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
@@ -72,6 +77,21 @@ class DiffusionTransformerTimmPolicy(BaseImagePolicy):
             ):
         model = self.model
         scheduler = self.noise_scheduler
+        # Optionally switch to DPM-Solver++ for faster inference
+        if getattr(self, 'use_dpm_solver', False):
+            # Build a DPM-Solver scheduler that reuses the training scheduler's config (betas, prediction_type, etc.)
+            try:
+                dpm_scheduler = DPMSolverMultistepScheduler.from_config(scheduler.config)
+            except Exception:
+                # Fallback: construct with defaults if the training scheduler lacks a config
+                dpm_scheduler = DPMSolverMultistepScheduler()
+            # Enforce solver order if available (2 or 3 are typical)
+            if hasattr(dpm_scheduler, 'config') and hasattr(dpm_scheduler.config, 'solver_order'):
+                dpm_scheduler.config.solver_order = int(getattr(self, 'dpm_solver_order', 2))
+            # DPM-Solver expects 'epsilon' or 'v_prediction'; guard against 'sample'
+            if hasattr(dpm_scheduler, 'config') and getattr(dpm_scheduler.config, 'prediction_type', None) == 'sample':
+                dpm_scheduler.config.prediction_type = 'epsilon'
+            scheduler = dpm_scheduler
 
         trajectory = torch.randn(
             size=condition_data.shape, 

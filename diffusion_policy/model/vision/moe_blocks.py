@@ -11,17 +11,18 @@ class AdapterMoEBlock(nn.Module):
         self.base_block = base_block
         self.adapter_dim = adapter_dim
         self.num_experts = num_experts
+        d_model = base_block.mlp.fc1.in_features
 
         # 每个专家是一个简单的Adapter瓶颈结构
         self.experts = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(base_block.mlp.fc2.in_features, adapter_dim),
+                nn.Linear(d_model, adapter_dim),
                 nn.GELU(),
-                nn.Linear(adapter_dim, base_block.mlp.fc2.in_features)
+                nn.Linear(adapter_dim, d_model)
             ) for _ in range(num_experts)
         ])
         # 路由器，将输入投影到专家权重
-        self.router = nn.Linear(base_block.mlp.fc2.in_features, num_experts)
+        self.router = nn.Linear(d_model, num_experts)
 
     def forward(self, x):
         # ViT主干前向
