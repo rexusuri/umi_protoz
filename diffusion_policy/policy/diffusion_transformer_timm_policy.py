@@ -12,6 +12,7 @@ from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.diffusion.transformer_for_action_diffusion import TransformerForActionDiffusion
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.vision.transformer_obs_encoder import TransformerObsEncoder
+from diffusion_policy.model.vision.moe_blocks import MoEFeedForward
 
 
 class DiffusionTransformerTimmPolicy(BaseImagePolicy):
@@ -201,6 +202,8 @@ class DiffusionTransformerTimmPolicy(BaseImagePolicy):
         trajectory = nactions
         
         # process input
+        # 这一步前向传播会触发 MoEFeedForward 模块的 forward 方法，
+        # 从而计算并缓存 self.aux_loss
         obs_tokens = self.obs_encoder(nobs)
         # (B, N, n_emb)
         
@@ -236,12 +239,37 @@ class DiffusionTransformerTimmPolicy(BaseImagePolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
-        loss = F.mse_loss(pred, target, reduction='none')
-        loss = loss.type(loss.dtype)
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
+        # 计算主损失 (Diffusion Loss)
+        main_loss = F.mse_loss(pred, target, reduction='none')
+        main_loss = main_loss.type(main_loss.dtype)
+        main_loss = reduce(main_loss, 'b ... -> b (...)', 'mean')
+        main_loss = main_loss.mean()
 
-        return loss
+        # ###############################################################
+        # ############## START OF MODIFICATION ##########################
+        # ###############################################################
+
+        # 收集并累加所有MoE模块的辅助损失
+        aux_loss = 0.0
+        # self.obs_encoder 就是 TransformerObsEncoder 的实例
+        # 它的 key_model_map 属性包含了 ViT 模型
+        # 注意: timm ViT 模型的实例变量名是 model_name
+        for model in self.obs_encoder.key_model_map.values():
+            if 'vit' in getattr(model, 'model_name', ''):
+                for block in model.blocks:
+                    # 检查FFN层是否是我们的MoE模块
+                    if isinstance(block.mlp, MoEFeedForward):
+                        if hasattr(block.mlp, 'aux_loss') and block.mlp.aux_loss is not None:
+                            aux_loss += block.mlp.aux_loss
+        
+        # 将主损失和辅助损失相加
+        total_loss = main_loss + aux_loss
+
+        # ###############################################################
+        # ############### END OF MODIFICATION ###########################
+        # ###############################################################
+
+        return total_loss
 
     def forward(self, batch):
         return self.compute_loss(batch)

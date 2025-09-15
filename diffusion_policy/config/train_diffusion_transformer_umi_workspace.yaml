@@ -36,6 +36,14 @@ policy:
     global_pool: ''
     n_emb: ${n_emb}
 
+    use_moe: True  # <-- 总开关，设为 True 来启用 MoE
+
+    # MoE 模块的详细参数
+    moe_layers: [8, 9, 10, 11]            # 要替换的 ViT 层
+    moe_d_ffn: 3072                         # 专家的 FFN 隐藏层维度。对于 ViT-Base 是 3072，ViT-Large 是 4096
+    moe_num_experts: 8                      # 专家数量
+    moe_top_k: 2           
+
     ##### from scratch #####
     # model_name: 'vit_base_patch16_224'
     # model_name: 'resnet34'
@@ -128,7 +136,7 @@ optimizer:
   betas: [0.95, 0.999]
   
 training:
-  device: "mps"
+  device: "cuda:0"
   seed: 42
   debug: False
   resume: False

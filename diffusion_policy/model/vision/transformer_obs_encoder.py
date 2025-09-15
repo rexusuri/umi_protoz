@@ -12,7 +12,8 @@ from diffusion_policy.model.common.module_attr_mixin import ModuleAttrMixin
 
 from diffusion_policy.common.pytorch_util import replace_submodules
 
-from .moe_blocks import replace_vit_blocks_with_moe  # 放在文件开头import
+# from .moe_blocks import replace_vit_blocks_with_moe  <-- 注释掉旧的
+from .moe_blocks import replace_ffn_with_moe  # <-- 导入新的
 
 logger = logging.getLogger(__name__)
 
@@ -66,13 +67,24 @@ class TransformerObsEncoder(ModuleAttrMixin):
             # use single rgb model for all rgb inputs
             share_rgb_model: bool=False,
             feature_aggregation: str=None,
-            downsample_ratio: int=32
+            downsample_ratio: int=32,
+            use_moe: bool=False,
+            moe_layers: list=None,
+            moe_d_ffn: int=None,
+            moe_num_experts: int=8,
+            moe_top_k: int=2
         ):
         """
         Assumes rgb input: B,T,C,H,W
         Assumes low_dim input: B,T,D
         """
         super().__init__()
+        
+        self.use_moe = use_moe
+        self.moe_layers = moe_layers
+        self.moe_d_ffn = moe_d_ffn
+        self.moe_num_experts = moe_num_experts
+        self.moe_top_k = moe_top_k
         
         rgb_keys = list()
         low_dim_keys = list()
@@ -90,9 +102,19 @@ class TransformerObsEncoder(ModuleAttrMixin):
         )
         self.model_name = model_name
         
-        if model_name.startswith('vit'):
-            moe_layers = [8, 9, 10, 11]  # 或你需要的层号
-            model = replace_vit_blocks_with_moe(model, moe_layers, adapter_dim=192, num_experts=4)
+        if self.use_moe and model_name.startswith('vit'):
+            # 添加一些检查，确保关键参数已在 YAML 中提供
+            if self.moe_layers is None or self.moe_d_ffn is None:
+                raise ValueError("When use_moe is True, 'moe_layers' and 'moe_d_ffn' must be provided in the YAML config.")
+            
+            logger.info(f"Replacing ViT layers {self.moe_layers} with MoE blocks.")
+            model = replace_ffn_with_moe(
+                model, 
+                layers=self.moe_layers, 
+                d_ffn=self.moe_d_ffn, 
+                num_experts=self.moe_num_experts,
+                top_k=self.moe_top_k
+            )
 
         if frozen:
             assert pretrained
