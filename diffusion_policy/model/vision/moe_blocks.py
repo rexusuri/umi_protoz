@@ -32,6 +32,8 @@ class MoEFeedForward(nn.Module):
         
         # 重要的属性：用于在外部访问辅助损失
         self.aux_loss = None
+        
+        self.register_buffer('expert_usage', torch.zeros(self.num_experts))
 
     def forward(self, x):
         # x shape: [batch_size, sequence_length, d_model]
@@ -66,6 +68,11 @@ class MoEFeedForward(nn.Module):
             # 这个损失鼓励 tokens_per_expert 和 router_prob_per_expert 都接近均匀分布
             self.aux_loss = (tokens_per_expert * router_prob_per_expert).sum() * self.num_experts
             self.aux_loss = self.aux_loss * self.aux_loss_weight
+            
+            flat_indices = top_k_indices.flatten()
+            # bincount 会返回一个长度为 num_experts 的向量，每个位置的值是该专家被调用的总次数。
+            self.expert_usage = torch.bincount(flat_indices, minlength=self.num_experts)
+
         else:
             self.aux_loss = 0 # 推理时不需要
 

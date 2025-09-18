@@ -28,6 +28,7 @@ from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
+from diffusion_policy.model.vision.moe_blocks import MoEFeedForward
 from accelerate import Accelerator
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
@@ -228,6 +229,36 @@ class TrainDiffusionTransformerTimmWorkspace(BaseWorkspace):
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
+                        
+                        # 聚合所有 MoE 层的专家利用率
+                        # 注意：需要 unwrap 模型以访问内部模块
+                        unwrapped_model = accelerator.unwrap_model(self.model)
+                        total_expert_usage = None
+                        num_moe_layers = 0
+                        
+                        # 遍历视觉编码器中的所有模型
+                        for model in unwrapped_model.obs_encoder.key_model_map.values():
+                            if 'vit' in getattr(model, 'model_name', ''):
+                                for block in model.blocks:
+                                    if isinstance(block.mlp, MoEFeedForward):
+                                        # 将每个MoE层的 expert_usage 累加起来
+                                        if total_expert_usage is None:
+                                            total_expert_usage = block.mlp.expert_usage.detach().cpu()
+                                        else:
+                                            total_expert_usage += block.mlp.expert_usage.detach().cpu()
+                                        num_moe_layers += 1
+                        
+                        # 如果找到了 MoE 层，就计算并记录利用率
+                        if total_expert_usage is not None and num_moe_layers > 0:
+                            # 计算总调用次数
+                            total_tokens_routed = total_expert_usage.sum()
+                            if total_tokens_routed > 0:
+                                # 计算每个专家的利用率百分比
+                                expert_util_percent = (total_expert_usage / total_tokens_routed) * 100
+                                # 将每个专家的利用率添加到日志中
+                                for i in range(len(expert_util_percent)):
+                                    step_log[f'expert_util/expert_{i}_%'] = expert_util_percent[i].item()
+
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
