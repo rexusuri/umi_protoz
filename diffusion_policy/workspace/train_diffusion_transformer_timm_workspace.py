@@ -230,35 +230,57 @@ class TrainDiffusionTransformerTimmWorkspace(BaseWorkspace):
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
                         
-                        # 聚合所有 MoE 层的专家利用率
-                        # 注意：需要 unwrap 模型以访问内部模块
-                        unwrapped_model = accelerator.unwrap_model(self.model)
-                        total_expert_usage = None
-                        num_moe_layers = 0
-                        
-                        # 遍历视觉编码器中的所有模型
-                        for model in unwrapped_model.obs_encoder.key_model_map.values():
-                            if 'vit' in getattr(model, 'model_name', ''):
-                                for block in model.blocks:
-                                    if isinstance(block.mlp, MoEFeedForward):
-                                        # 将每个MoE层的 expert_usage 累加起来
-                                        if total_expert_usage is None:
-                                            total_expert_usage = block.mlp.expert_usage.detach().cpu()
-                                        else:
-                                            total_expert_usage += block.mlp.expert_usage.detach().cpu()
-                                        num_moe_layers += 1
-                        
-                        # 如果找到了 MoE 层，就计算并记录利用率
-                        if total_expert_usage is not None and num_moe_layers > 0:
-                            # 计算总调用次数
-                            total_tokens_routed = total_expert_usage.sum()
-                            if total_tokens_routed > 0:
-                                # 计算每个专家的利用率百分比
-                                expert_util_percent = (total_expert_usage / total_tokens_routed) * 100
-                                # 将每个专家的利用率添加到日志中
-                                for i in range(len(expert_util_percent)):
-                                    step_log[f'expert_util/expert_{i}_%'] = expert_util_percent[i].item()
+                        try:
+    # 1. 聚合所有 MoE 层的专家利用率
+                            unwrapped_model = accelerator.unwrap_model(self.model)
+                            total_expert_usage = None
+                            num_moe_layers = 0
+                            
+                            # [DEBUG] Uncomment the next line to debug the entry point
+                            # print("\n--- [DEBUG] Checking for MoE utilization ---")
+                            
+                            for model in unwrapped_model.obs_encoder.key_model_map.values():
+                                if 'vit' in getattr(model, 'model_name', ''):
+                                    for block in model.blocks:
+                                        if isinstance(block.mlp, MoEFeedForward):
+                                            if total_expert_usage is None:
+                                                total_expert_usage = block.mlp.expert_usage.detach().cpu()
+                                            else:
+                                                total_expert_usage += block.mlp.expert_usage.detach().cpu()
+                                            num_moe_layers += 1
 
+                            # 2. 如果找到了 MoE 层，计算并记录日志
+                            if total_expert_usage is not None and num_moe_layers > 0:
+                                total_tokens_routed = total_expert_usage.sum()
+                                
+                                if total_tokens_routed > 0:
+                                    expert_util_percent = (total_expert_usage / total_tokens_routed) * 100
+                                    
+                                    # 2a. 准备并记录 W&B 自动条形图
+                                    table_columns = ["Expert ID", "Utilization (%)"]
+                                    table_data = []
+                                    for i in range(len(expert_util_percent)):
+                                        table_data.append([f"Expert {i}", expert_util_percent[i].item()])
+                                    
+                                    util_table = wandb.Table(columns=table_columns, data=table_data)
+                                    
+                                    step_log["Expert Utilization/Distribution Bar Chart"] = wandb.plot.bar(
+                                        util_table, 
+                                        "Expert ID",
+                                        "Utilization (%)",
+                                        title="Expert Utilization Distribution per Step"
+                                    )
+                                    
+                                    # 2b. (可选) 记录每个专家的独立指标，用于折线图等
+                                    for i in range(len(expert_util_percent)):
+                                        step_log[f'Expert Utilization/expert_{i}_%'] = expert_util_percent[i].item()
+
+                                    # [DEBUG] Uncomment the next line to see the logged dictionary
+                                    # print(f"[DEBUG] Logging to W&B: {step_log}")
+                                    
+                        except Exception as e:
+                            # Using a logger is better, but print is fine for quick debugging.
+                            print(f"\n!!!!!! [ERROR] An error occurred during MoE utilization logging: {e}\n")
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
@@ -271,7 +293,7 @@ class TrainDiffusionTransformerTimmWorkspace(BaseWorkspace):
                             and batch_idx >= (cfg.training.max_train_steps-1):
                             break
 
-                # at the end of each epoch
+                # at the end of each epochs
                 # replace train_loss with epoch average
                 train_loss = np.mean(train_losses)
                 step_log['train_loss'] = train_loss
