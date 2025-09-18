@@ -231,56 +231,55 @@ class TrainDiffusionTransformerTimmWorkspace(BaseWorkspace):
                         }
                         
                         try:
-    # 1. 聚合所有 MoE 层的专家利用率
+                            # 打印一个清晰的标记，确认代码块开始执行
+                            print("\n--- [DEBUG] Attempting to log MoE utilization ---") 
+                            
                             unwrapped_model = accelerator.unwrap_model(self.model)
                             total_expert_usage = None
                             num_moe_layers = 0
                             
-                            # [DEBUG] Uncomment the next line to debug the entry point
-                            # print("\n--- [DEBUG] Checking for MoE utilization ---")
-                            
-                            for model in unwrapped_model.obs_encoder.key_model_map.values():
+                            for model_key, model in unwrapped_model.obs_encoder.key_model_map.items():
                                 if 'vit' in getattr(model, 'model_name', ''):
-                                    for block in model.blocks:
+                                    print(f"[DEBUG] Found ViT model in key_model_map: '{model_key}'")
+                                    for i, block in enumerate(model.blocks):
+                                        # 打印每个block的MLP类型，这是定位问题的关键！！！
+                                        print(f"[DEBUG] Checking Block {i}, MLP type is: {type(block.mlp)}") 
+                                        
                                         if isinstance(block.mlp, MoEFeedForward):
+                                            print(f"  [SUCCESS] Found MoEFeedForward layer in Block {i}!")
+                                            usage_cpu = block.mlp.expert_usage.detach().cpu()
+                                            print(f"  [DEBUG] Expert usage for this layer: {usage_cpu.numpy()}")
                                             if total_expert_usage is None:
-                                                total_expert_usage = block.mlp.expert_usage.detach().cpu()
+                                                total_expert_usage = usage_cpu
                                             else:
-                                                total_expert_usage += block.mlp.expert_usage.detach().cpu()
+                                                total_expert_usage += usage_cpu
                                             num_moe_layers += 1
-
-                            # 2. 如果找到了 MoE 层，计算并记录日志
+                            
                             if total_expert_usage is not None and num_moe_layers > 0:
                                 total_tokens_routed = total_expert_usage.sum()
-                                
                                 if total_tokens_routed > 0:
                                     expert_util_percent = (total_expert_usage / total_tokens_routed) * 100
                                     
-                                    # 2a. 准备并记录 W&B 自动条形图
+                                    # ... W&B Bar Chart logging (kept from before) ...
                                     table_columns = ["Expert ID", "Utilization (%)"]
                                     table_data = []
                                     for i in range(len(expert_util_percent)):
                                         table_data.append([f"Expert {i}", expert_util_percent[i].item()])
-                                    
                                     util_table = wandb.Table(columns=table_columns, data=table_data)
-                                    
-                                    step_log["Expert Utilization/Distribution Bar Chart"] = wandb.plot.bar(
-                                        util_table, 
-                                        "Expert ID",
-                                        "Utilization (%)",
-                                        title="Expert Utilization Distribution per Step"
-                                    )
-                                    
-                                    # 2b. (可选) 记录每个专家的独立指标，用于折线图等
-                                    for i in range(len(expert_util_percent)):
-                                        step_log[f'Expert Utilization/expert_{i}_%'] = expert_util_percent[i].item()
+                                    step_log["Expert Utilization/Distribution Bar Chart"] = wandb.plot.bar(util_table, "Expert ID", "Utilization (%)", title="Expert Utilization Distribution per Step")
 
-                                    # [DEBUG] Uncomment the next line to see the logged dictionary
-                                    # print(f"[DEBUG] Logging to W&B: {step_log}")
-                                    
+                                    for i in range(len(expert_util_percent)):
+                                        log_key = f'Expert Utilization/expert_{i}_%'
+                                        log_value = expert_util_percent[i].item()
+                                        step_log[log_key] = log_value
+                                        # 打印将要发送给W&B的数据
+                                        print(f"  [LOGGING] Adding to step_log: '{log_key}': {log_value:.2f}%")
+                            else:
+                                print("[DEBUG] No MoE layers found or no usage was recorded in this step.")
+
                         except Exception as e:
-                            # Using a logger is better, but print is fine for quick debugging.
                             print(f"\n!!!!!! [ERROR] An error occurred during MoE utilization logging: {e}\n")
+
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
