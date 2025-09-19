@@ -30,19 +30,18 @@ policy:
     steps_offset: 0
     prediction_type: epsilon # or sample
 
+  moe_config:
+    use_moe: True
+    moe_layers: [8, 9, 10, 11]
+    moe_d_ffn: 3072
+    moe_num_experts: 8
+    moe_top_k: 2
+    
   obs_encoder:
     _target_: diffusion_policy.model.vision.transformer_obs_encoder.TransformerObsEncoder
     shape_meta: ${shape_meta}
     global_pool: ''
-    n_emb: ${n_emb}
-
-    use_moe: True  # <-- 总开关，设为 True 来启用 MoE
-
-    # MoE 模块的详细参数
-    moe_layers: [8, 9, 10, 11]            # 要替换的 ViT 层
-    moe_d_ffn: 3072                         # 专家的 FFN 隐藏层维度。对于 ViT-Base 是 3072，ViT-Large 是 4096
-    moe_num_experts: 8                      # 专家数量
-    moe_top_k: 2           
+    n_emb: ${n_emb}        
 
     ##### from scratch #####
     # model_name: 'vit_base_patch16_224'
