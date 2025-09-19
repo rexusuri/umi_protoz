@@ -29,13 +29,6 @@ policy:
     set_alpha_to_one: True
     steps_offset: 0
     prediction_type: epsilon # or sample
-
-  moe_config:
-    use_moe: True
-    moe_layers: [8, 9, 10, 11]
-    moe_d_ffn: 3072
-    moe_num_experts: 8
-    moe_top_k: 2
     
   obs_encoder:
     _target_: diffusion_policy.model.vision.transformer_obs_encoder.TransformerObsEncoder
@@ -43,6 +36,11 @@ policy:
     global_pool: ''
     n_emb: ${n_emb}        
 
+    use_moe: true
+    moe_layers: [8, 9, 10, 11]
+    moe_d_ffn: 3072  # 对于ViT-Base, 这个值是 d_model (768) 的4倍
+    moe_num_experts: 8
+    moe_top_k: 2
     ##### from scratch #####
     # model_name: 'vit_base_patch16_224'
     # model_name: 'resnet34'
@@ -159,6 +157,9 @@ training:
   max_val_steps: null
   # misc
   tqdm_interval_sec: 1.0
+  multi_gpu:
+    enabled: false
+    mixed_precision: 'no'
 
 logging:
   project: umi

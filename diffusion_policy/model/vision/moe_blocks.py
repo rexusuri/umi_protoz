@@ -1,10 +1,8 @@
-# 文件: diffusion_policy/model/vision/moe_blocks.py
+# filename: moe_blocks.py (修正版)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
-from timm.models.vision_transformer import VisionTransformer
 
 class MoEFeedForward(nn.Module):
     """
@@ -42,48 +40,48 @@ class MoEFeedForward(nn.Module):
         if self.training:
             zeros = torch.zeros_like(router_logits, requires_grad=False)
             mask = zeros.scatter(-1, top_k_indices, 1)
-            
             tokens_per_expert = torch.mean(mask.float(), dim=0)
             router_prob_per_expert = torch.mean(F.softmax(router_logits, dim=-1).float(), dim=0)
-            
             self.aux_loss = (tokens_per_expert * router_prob_per_expert).sum() * self.num_experts
             self.aux_loss = self.aux_loss * self.aux_loss_weight
             
             flat_indices = top_k_indices.flatten()
             self.expert_usage = torch.bincount(flat_indices, minlength=self.num_experts)
+
         else:
-            self.aux_loss = 0
+            self.aux_loss = torch.tensor(0.0, device=x.device)
 
         output = torch.zeros_like(x_flat)
         for i in range(self.num_experts):
-            token_indices = (top_k_indices == i).any(dim=-1)
-            if token_indices.any():
-                selected_tokens = x_flat[token_indices]
-                gate_indices = (top_k_indices[token_indices] == i) 
-                selected_gates = gates[token_indices][gate_indices].unsqueeze(-1)
-                expert_output = self.experts[i](selected_tokens)
-                output[token_indices] += expert_output * selected_gates
+            token_indices_mask = (top_k_indices == i).any(dim=-1)
+            
+            if token_indices_mask.any():
+                selected_tokens = x_flat[token_indices_mask]
+                gate_indices_mask = (top_k_indices[token_indices_mask] == i)
+                selected_gates = gates[token_indices_mask][gate_indices_mask].unsqueeze(-1)
+                expert_output = self.experts[i](selected_tokens) * selected_gates
+                
+                # =========================================================
+                # ==================== 这里是修改点 =======================
+                # =========================================================
+                # 使用标准的布尔掩码索引进行原地相加
+                output[token_indices_mask] += expert_output
 
-        return output.view(batch_size, seq_len, -1)
+        output = output.view(batch_size, seq_len, -1)
+        return output
 
-class MoEVisionTransformer(VisionTransformer):
+def replace_ffn_with_moe(model, layers, d_ffn, num_experts=8, top_k=2):
     """
-    一个继承自 timm.VisionTransformer 的自定义类，
-    它在初始化时就将指定的 FFN 层替换为 MoE 层。
+    一个辅助函数，用于替换指定ViT block的FFN (Mlp) 为 MoE-FFN 层
     """
-    def __init__(self, moe_layers: list, moe_d_ffn: int, moe_num_experts: int, moe_top_k: int, **kwargs):
-        # 首先，调用父类 (原始 ViT) 的 __init__ 方法，让它构建一个标准的 ViT
-        super().__init__(**kwargs)
+    for i in layers:
+        original_block = model.blocks[i]
+        d_model = original_block.mlp.fc1.in_features
         
-        # 现在，self.blocks 已经是一个包含标准 Block 的 ModuleList 了
-        # 我们可以对它进行“手术”
-        for i in moe_layers:
-            original_mlp = self.blocks[i].mlp
-            d_model = original_mlp.fc1.in_features
-
-            self.blocks[i].mlp = MoEFeedForward(
-                d_model=d_model,
-                d_ffn=moe_d_ffn,
-                num_experts=moe_num_experts,
-                top_k=moe_top_k
-            )
+        original_block.mlp = MoEFeedForward(
+            d_model=d_model,
+            d_ffn=d_ffn,
+            num_experts=num_experts,
+            top_k=top_k
+        )
+    return model
