@@ -19,6 +19,7 @@ import tqdm
 import numpy as np
 import pickle
 import wandb  # <--- 新增导入
+import torch.nn as nn
 
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
@@ -233,21 +234,29 @@ class TrainDiffusionTransformerTimmWorkspace(BaseWorkspace):
                              step_log['aux_loss'] = total_aux_loss.item()
 
 
-                        # ==================== W&B MoE Logging Start (FINAL CORRECTED VERSION) ====================
+                        # ==================== W&B MoE Logging Start (FINAL DEBUG) ====================
                         try:
+                            #print("\n--- [DEBUG] Attempting to log MoE utilization ---", flush=True)
                             unwrapped_model = accelerator.unwrap_model(self.model)
                             total_expert_usage = None
                             num_moe_layers = 0
                             
                             # 遍历ObsEncoder中的所有视觉模型
-                            for model in unwrapped_model.obs_encoder.key_model_map.values():
-                                # 修正检查逻辑：通过检查模型是否具有 'blocks' 属性来判断它是否是ViT
-                                if hasattr(model, 'blocks') and isinstance(model.blocks, nn.ModuleList):
+                            #print(f"[DEBUG] Found {len(unwrapped_model.obs_encoder.key_model_map)} models in key_model_map.", flush=True)
+                            for model_key, model in unwrapped_model.obs_encoder.key_model_map.items():
+                                #print(f"[DEBUG] Checking model for key '{model_key}', type: {type(model)}", flush=True)
+                                
+                                # 修正后的检查逻辑
+                                has_blocks_attr = hasattr(model, 'blocks')
+                                #print(f"[DEBUG] Model for '{model_key}' has 'blocks' attribute: {has_blocks_attr}", flush=True)
+                                
+                                if has_blocks_attr:
+                                    #print(f"  [SUCCESS] Model for '{model_key}' is a ViT, checking its blocks.", flush=True)
                                     # 遍历ViT的所有block
-                                    for block in model.blocks:
-                                        # 检查这个block的mlp层是否是我们的MoE层
-                                        if isinstance(block.mlp, MoEFeedForward):
-                                            # 从设备上取回使用情况数据并累加
+                                    for i, block in enumerate(model.blocks):
+                                        #print(f"    [DEBUG] Checking Block {i}, MLP type is: {type(block.mlp)}", flush=True)
+                                        if hasattr(block.mlp, 'aux_loss'):
+                                            #print(f"      [SUCCESS] Found MoEFeedForward layer in Block {i}!", flush=True)
                                             usage_cpu = block.mlp.expert_usage.detach().cpu()
                                             if total_expert_usage is None:
                                                 total_expert_usage = usage_cpu
@@ -255,27 +264,26 @@ class TrainDiffusionTransformerTimmWorkspace(BaseWorkspace):
                                                 total_expert_usage += usage_cpu
                                             num_moe_layers += 1
                             
-                            # 如果找到了MoE层，则记录日志
                             if total_expert_usage is not None and num_moe_layers > 0:
+                                #print("[DEBUG] MoE layers were found! Preparing data for wandb.", flush=True)
+                                # ... (后续创建图表的部分和之前一样)
                                 total_tokens_routed = total_expert_usage.sum()
                                 if total_tokens_routed > 0:
                                     expert_util_percent = (total_expert_usage / total_tokens_routed) * 100
-                                    
                                     table_data = []
                                     for i in range(len(expert_util_percent)):
                                         table_data.append([f"Expert {i}", expert_util_percent[i].item()])
-                                    
                                     util_table = wandb.Table(columns=["Expert ID", "Utilization (%)"], data=table_data)
                                     step_log["Expert Utilization/Distribution Bar Chart"] = wandb.plot.bar(
                                         util_table, "Expert ID", "Utilization (%)", title="Expert Utilization Distribution per Step"
                                     )
-
-                                    for i in range(len(expert_util_percent)):
-                                        step_log[f'Expert Utilization/expert_{i}_%'] = expert_util_percent[i].item()
+                                    #print("[DEBUG] Successfully created wandb bar chart object.", flush=True)
+                            else:
+                                print("[DEBUG] After checking all models, no MoE layers were found.", flush=True)
 
                         except Exception as e:
-                            print(f"\n[Warning] An error occurred during MoE utilization logging: {e}\n")
-                        # ===================== W&B MoE Logging End (FINAL CORRECTED VERSION) =====================
+                            print(f"\n!!!!!! [ERROR] An error occurred during MoE utilization logging: {e}\n", flush=True)
+                        # ===================== W&B MoE Logging End (FINAL DEBUG) =====================
 
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
