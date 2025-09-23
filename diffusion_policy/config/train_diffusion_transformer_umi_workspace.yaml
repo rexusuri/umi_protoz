@@ -102,7 +102,6 @@ policy:
   n_emb: ${n_emb}
   p_drop_attn: 0.1
   
-
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
   update_after_step: 0
@@ -112,7 +111,7 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 4
+  batch_size: 12
   num_workers: 1
   shuffle: True
   pin_memory: True
