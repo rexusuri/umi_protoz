@@ -10,7 +10,8 @@ if __name__ == "__main__":
 import os
 import hydra
 import torch
-from omegaconf import OmegaConf
+import torch.nn as nn
+from omegaconf import OmegaConf, open_dict
 import pathlib
 from torch.utils.data import DataLoader
 import copy
@@ -18,8 +19,8 @@ import random
 import tqdm
 import numpy as np
 import pickle
-import wandb  # <--- 新增导入
-import torch.nn as nn
+import wandb
+import deepspeed
 
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
@@ -29,13 +30,11 @@ from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.model.diffusion.ema_model import EMAModel
-from diffusion_policy.model.common.lr_scheduler import get_scheduler
-from diffusion_policy.model.vision.moe_blocks import MoEFeedForward  # <--- 新增导入
-from accelerate import Accelerator
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 class TrainDiffusionTransformerTimmWorkspace(BaseWorkspace):
+    # DeepSpeed manages its own state for checkpointing
     include_keys = ['global_step', 'epoch']
 
     def __init__(self, cfg: OmegaConf):
@@ -51,322 +50,173 @@ class TrainDiffusionTransformerTimmWorkspace(BaseWorkspace):
         self.model: DiffusionTransformerTimmPolicy
         self.model = hydra.utils.instantiate(cfg.policy)
 
-        self.ema_model: DiffusionTransformerTimmPolicy = None
-        if cfg.training.use_ema:
-            self.ema_model = copy.deepcopy(self.model)
+        # The optimizer is now created by DeepSpeed during initialization
+        self.optimizer = None
 
-        # configure training state
-        self.optimizer = self.model.get_optimizer(**cfg.optimizer)
-
+        # training state
         self.global_step = 0
         self.epoch = 0
         
-        # do not save optimizer if resume=False
         if not cfg.training.resume:
-            self.exclude_keys = ['optimizer']
+            self.exclude_keys = []
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
         
-        # accelerator
-        accelerator_kwargs = dict()
-        if cfg.training.multi_gpu.enabled:
-            accelerator_kwargs['mixed_precision'] = cfg.training.multi_gpu.mixed_precision
+        # Initialize DeepSpeed Distributed Training
+        deepspeed.init_distributed()
         
-        accelerator = Accelerator(
-            log_with='wandb',
-            **accelerator_kwargs
-            )
+        # Add deepspeed config to the main config for logging purposes
+        with open_dict(cfg):
+            cfg.deepspeed_config = cfg.training.deepspeed_config
+        
+        # Initialize WandB only on the main process (rank 0)
+        if deepspeed.comm.get_rank() == 0:
+            wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
+            # project name is passed directly to init
+            if 'project' in wandb_cfg:
+                wandb_project = wandb_cfg.pop('project')
+            else:
+                wandb_project = 'deepspeed_run'
             
-        wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
-        wandb_cfg.pop('project')
-        accelerator.init_trackers(
-            project_name=cfg.logging.project,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            init_kwargs={"wandb": wandb_cfg}
-        )
+            wandb.init(
+                project=wandb_project,
+                config=OmegaConf.to_container(cfg, resolve=True),
+                **wandb_cfg
+            )
 
-        # resume training
-        if cfg.training.resume:
-            lastest_ckpt_path = self.get_checkpoint_path()
-            if lastest_ckpt_path.is_file():
-                print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                self.load_checkpoint(path=lastest_ckpt_path)
-
-        # configure dataset
+        # Configure dataset
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset) or isinstance(dataset, BaseDataset)
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
-
-        # compute normalizer on the main process and save to disk
-        normalizer_path = os.path.join(self.output_dir, 'normalizer.pkl')
-        if accelerator.is_main_process:
-            normalizer = dataset.get_normalizer()
-            pickle.dump(normalizer, open(normalizer_path, 'wb'))
         
-        accelerator.wait_for_everyone()
-        normalizer = pickle.load(open(normalizer_path, 'rb'))
+        # Normalizer should be computed on rank 0 and then loaded by all processes
+        normalizer_path = os.path.join(self.output_dir, 'normalizer.pkl')
+        if deepspeed.comm.get_rank() == 0:
+            normalizer = dataset.get_normalizer()
+            with open(normalizer_path, 'wb') as f:
+                pickle.dump(normalizer, f)
+        
+        # Synchronize all processes to make sure the file is written
+        torch.distributed.barrier()
+        with open(normalizer_path, 'rb') as f:
+            normalizer = pickle.load(f)
 
-        # configure validation dataset
+        # Configure dataloaders
+        train_dataloader = DataLoader(dataset, **cfg.dataloader)
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
 
         self.model.set_normalizer(normalizer)
-        if cfg.training.use_ema:
-            self.ema_model.set_normalizer(normalizer)
-
-        # configure lr scheduler
-        lr_scheduler = get_scheduler(
-            cfg.training.lr_scheduler,
-            optimizer=self.optimizer,
-            num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs) \
-                    // cfg.training.gradient_accumulate_every,
-            last_epoch=self.global_step-1
+        
+        # DeepSpeed initialization
+        model_engine, self.optimizer, _, _ = deepspeed.initialize(
+            model=self.model,
+            config=cfg.training.deepspeed_config,
+            model_parameters=self.model.get_optimizer_params(cfg.optimizer),
         )
+        
+        device = model_engine.device
 
-        # configure ema
-        ema: EMAModel = None
-        if cfg.training.use_ema:
-            ema = hydra.utils.instantiate(
-                cfg.ema,
-                model=self.ema_model)
+        # Configure env runner and checkpoint manager on the main process only
+        env_runner: BaseImageRunner = None
+        topk_manager: TopKCheckpointManager = None
+        if deepspeed.comm.get_rank() == 0:
+            env_runner = hydra.utils.instantiate(
+                cfg.task.env_runner,
+                output_dir=self.output_dir)
+            assert isinstance(env_runner, BaseImageRunner)
+            
+            topk_manager = TopKCheckpointManager(
+                save_dir=os.path.join(self.output_dir, 'checkpoints'),
+                **cfg.checkpoint.topk
+            )
 
-        # configure env
-        env_runner: BaseImageRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
-        assert isinstance(env_runner, BaseImageRunner)
+        # Resume training using DeepSpeed's loading mechanism
+        if cfg.training.resume:
+            load_path, client_state = model_engine.load_checkpoint(self.output_dir)
+            if load_path is not None:
+                self.global_step = client_state.get('global_step', 0)
+                self.epoch = client_state.get('epoch', 0)
+                print(f"Resumed training from checkpoint {load_path} at global_step {self.global_step}")
 
-        # configure checkpoint
-        topk_manager = TopKCheckpointManager(
-            save_dir=os.path.join(self.output_dir, 'checkpoints'),
-            **cfg.checkpoint.topk
-        )
-
-        # accelerator
-        train_dataloader, val_dataloader, self.model, self.optimizer, lr_scheduler = accelerator.prepare(
-            train_dataloader, val_dataloader, self.model, self.optimizer, lr_scheduler
-        )
-        device = self.model.device
-        if self.ema_model is not None:
-            self.ema_model.to(device)
-
-
-        # save batch for sampling
-        train_sampling_batch = None
-
-        if cfg.training.debug:
-            cfg.training.num_epochs = 2
-            cfg.training.max_train_steps = 3
-            cfg.training.max_val_steps = 3
-            cfg.training.rollout_every = 1
-            cfg.training.checkpoint_every = 1
-            cfg.training.val_every = 1
-            cfg.training.sample_every = 1
-
-        # training loop
+        # Training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        with JsonLogger(log_path) as json_logger:
-            for local_epoch_idx in range(cfg.training.num_epochs):
-                self.model.train()
+        json_logger = JsonLogger(log_path) if deepspeed.comm.get_rank() == 0 else None
+        
+        for local_epoch_idx in range(cfg.training.num_epochs):
+            model_engine.train()
 
-                step_log = dict()
-                # ========= train for this epoch ==========
-                if cfg.training.freeze_encoder:
-                    self.model.obs_encoder.eval()
-                    self.model.obs_encoder.requires_grad_(False)
+            if cfg.training.freeze_encoder:
+                # Access the original model via model_engine.module
+                model_engine.module.obs_encoder.eval()
+                model_engine.module.obs_encoder.requires_grad_(False)
 
-                train_losses = list()
-                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
-                        leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
-                    for batch_idx, batch in enumerate(tepoch):
-                        # device transfer
-                        batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                        if train_sampling_batch is None:
-                            train_sampling_batch = batch
+            train_losses = list()
+            # Disable tqdm on all processes except the main one
+            with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
+                           disable=(deepspeed.comm.get_rank() != 0),
+                           leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
+                for batch_idx, batch in enumerate(tepoch):
+                    # Move data to the correct device
+                    batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                    
+                    # DeepSpeed MoE layer automatically returns (total_loss, aux_loss)
+                    # We need to ensure the policy's forward method is updated for this
+                    loss, aux_loss = model_engine(batch)
+                    
+                    # Backward pass
+                    model_engine.backward(loss)
+                    
+                    # Optimizer step
+                    model_engine.step()
 
-                        # always use the latest batch
-                        train_sampling_batch = batch
-
-                        # compute loss
-                        raw_loss = self.model(batch)
-                        
-                        # ========= MoE: 收集并添加辅助损失 =========
-                        total_aux_loss = 0.0
-                        # 必须 unwrap model 来访问我们自定义的模块
-                        unwrapped_model = accelerator.unwrap_model(self.model)
-                        for module in unwrapped_model.modules():
-                            if isinstance(module, MoEFeedForward):
-                                if module.aux_loss is not None:
-                                    total_aux_loss += module.aux_loss
-                        
-                        raw_loss += total_aux_loss
-                        # ============================================
-
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
-                        accelerator.backward(loss)
-
-                        # step optimizer
-                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()
-                            lr_scheduler.step()
-                        
-                        # update ema
-                        if cfg.training.use_ema:
-                            ema.step(accelerator.unwrap_model(self.model))
-
-                        # logging
-                        raw_loss_cpu = raw_loss.item()
+                    # Logging on the main process
+                    if deepspeed.comm.get_rank() == 0:
+                        raw_loss_cpu = loss.item()
                         tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
+                        
                         step_log = {
                             'train_loss': raw_loss_cpu,
+                            'aux_loss': aux_loss.item(),
                             'global_step': self.global_step,
                             'epoch': self.epoch,
-                            'lr': lr_scheduler.get_last_lr()[0]
+                            'lr': model_engine.get_lr()[0]
                         }
-                        if total_aux_loss != 0.0:
-                             step_log['aux_loss'] = total_aux_loss.item()
-
-
-                        # ==================== W&B MoE Logging Start (FINAL DEBUG) ====================
-                        if self.global_step % 1000 == 0:
-                            try:
-                                #print("\n--- [DEBUG] Attempting to log MoE utilization ---", flush=True)
-                                unwrapped_model = accelerator.unwrap_model(self.model)
-                                total_expert_usage = None
-                                num_moe_layers = 0
-                                
-                                # 遍历ObsEncoder中的所有视觉模型
-                                #print(f"[DEBUG] Found {len(unwrapped_model.obs_encoder.key_model_map)} models in key_model_map.", flush=True)
-                                for model_key, model in unwrapped_model.obs_encoder.key_model_map.items():
-                                    #print(f"[DEBUG] Checking model for key '{model_key}', type: {type(model)}", flush=True)
-                                    
-                                    # 修正后的检查逻辑
-                                    has_blocks_attr = hasattr(model, 'blocks')
-                                    #print(f"[DEBUG] Model for '{model_key}' has 'blocks' attribute: {has_blocks_attr}", flush=True)
-                                    
-                                    if has_blocks_attr:
-                                        #print(f"  [SUCCESS] Model for '{model_key}' is a ViT, checking its blocks.", flush=True)
-                                        # 遍历ViT的所有block
-                                        for i, block in enumerate(model.blocks):
-                                            #print(f"    [DEBUG] Checking Block {i}, MLP type is: {type(block.mlp)}", flush=True)
-                                            if hasattr(block.mlp, 'aux_loss'):
-                                                #print(f"      [SUCCESS] Found MoEFeedForward layer in Block {i}!", flush=True)
-                                                usage_cpu = block.mlp.expert_usage.detach().cpu()
-                                                if total_expert_usage is None:
-                                                    total_expert_usage = usage_cpu
-                                                else:
-                                                    total_expert_usage += usage_cpu
-                                                num_moe_layers += 1
-                                
-                                if total_expert_usage is not None and num_moe_layers > 0:
-                                    #print("[DEBUG] MoE layers were found! Preparing data for wandb.", flush=True)
-                                    # ... (后续创建图表的部分和之前一样)
-                                    total_tokens_routed = total_expert_usage.sum()
-                                    if total_tokens_routed > 0:
-                                        expert_util_percent = (total_expert_usage / total_tokens_routed) * 100
-                                        table_data = []
-                                        for i in range(len(expert_util_percent)):
-                                            table_data.append([f"Expert {i}", expert_util_percent[i].item()])
-                                        util_table = wandb.Table(columns=["Expert ID", "Utilization (%)"], data=table_data)
-                                        step_log["Expert Utilization/Distribution Bar Chart"] = wandb.plot.bar(
-                                            util_table, "Expert ID", "Utilization (%)", title="Expert Utilization Distribution per Step"
-                                        )
-                                        #print("[DEBUG] Successfully created wandb bar chart object.", flush=True)
-                                else:
-                                    print("[DEBUG] After checking all models, no MoE layers were found.", flush=True)
-
-                            except Exception as e:
-                                print(f"\n!!!!!! [ERROR] An error occurred during MoE utilization logging: {e}\n", flush=True)
-                        # ===================== W&B MoE Logging End (FINAL DEBUG) =====================
-
-
-                        is_last_batch = (batch_idx == (len(train_dataloader)-1))
-                        if not is_last_batch:
-                            accelerator.log(step_log, step=self.global_step)
+                        
+                        wandb.log(step_log, step=self.global_step)
+                        if json_logger:
                             json_logger.log(step_log)
-                            self.global_step += 1
+                        
+                        self.global_step += 1
 
-                        if (cfg.training.max_train_steps is not None) \
-                            and batch_idx >= (cfg.training.max_train_steps-1):
-                            break
+            # End of epoch evaluation and checkpointing on the main process
+            if deepspeed.comm.get_rank() == 0:
+                train_loss_mean = np.mean(train_losses)
+                epoch_end_log = {'train_loss_epoch': train_loss_mean}
 
-                # at the end of each epochs
-                # replace train_loss with epoch average
-                train_loss = np.mean(train_losses)
-                step_log['train_loss'] = train_loss
-
-                # ========= eval for this epoch ==========
-                policy = accelerator.unwrap_model(self.model)
-                if cfg.training.use_ema:
-                    policy = self.ema_model
+                policy = model_engine.module  # Get the unwrapped model for evaluation
                 policy.eval()
 
-                # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
+                # Run rollout
+                if (self.epoch % cfg.training.rollout_every) == 0 and env_runner is not None:
                     runner_log = env_runner.run(policy)
-                    step_log.update(runner_log)
-
-                def log_action_mse(step_log, category, pred_action, gt_action):
-                    B, T, _ = pred_action.shape
-                    pred_action = pred_action.view(B, T, -1, 10)
-                    gt_action = gt_action.view(B, T, -1, 10)
-                    step_log[f'{category}_action_mse_error'] = torch.nn.functional.mse_loss(pred_action, gt_action)
-                    step_log[f'{category}_action_mse_error_pos'] = torch.nn.functional.mse_loss(pred_action[..., :3], gt_action[..., :3])
-                    step_log[f'{category}_action_mse_error_rot'] = torch.nn.functional.mse_loss(pred_action[..., 3:9], gt_action[..., 3:9])
-                    step_log[f'{category}_action_mse_error_width'] = torch.nn.functional.mse_loss(pred_action[..., 9], gt_action[..., 9])
-
-                if (self.epoch % cfg.training.sample_every) == 0 and accelerator.is_main_process:
-                    with torch.no_grad():
-                        batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
-                        gt_action = batch['action']
-                        pred_action = policy.predict_action(batch['obs'])['action_pred']
-                        log_action_mse(step_log, 'train', pred_action, gt_action)
-
-                        if len(val_dataloader) > 0:
-                            val_sampling_batch = next(iter(val_dataloader))
-                            batch = dict_apply(val_sampling_batch, lambda x: x.to(device, non_blocking=True))
-                            gt_action = batch['action']
-                            pred_action = policy.predict_action(batch['obs'])['action_pred']
-                            log_action_mse(step_log, 'val', pred_action, gt_action)
-
-                        del batch
-                        del gt_action
-                        del pred_action
+                    epoch_end_log.update(runner_log)
                 
-                if (self.epoch % cfg.training.checkpoint_every) == 0 and accelerator.is_main_process:
-                    model_ddp = self.model
-                    self.model = accelerator.unwrap_model(self.model)
+                # Checkpointing
+                if (self.epoch % cfg.training.checkpoint_every) == 0:
+                    client_state = {
+                        'global_step': self.global_step,
+                        'epoch': self.epoch
+                    }
+                    model_engine.save_checkpoint(self.output_dir, client_state=client_state)
 
-                    if cfg.checkpoint.save_last_ckpt:
-                        self.save_checkpoint()
-                    if cfg.checkpoint.save_last_snapshot:
-                        self.save_snapshot()
-
-                    metric_dict = dict()
-                    for key, value in step_log.items():
-                        new_key = key.replace('/', '_')
-                        metric_dict[new_key] = value
-                    
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
-
-                    if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
-                    
-                    self.model = model_ddp
-
-                accelerator.log(step_log, step=self.global_step)
-                json_logger.log(step_log)
-                self.global_step += 1
+                wandb.log(epoch_end_log, step=self.global_step)
+                if json_logger:
+                    json_logger.log(epoch_end_log)
+                
                 self.epoch += 1
-
-        accelerator.end_training()
 
 @hydra.main(
     version_base=None,

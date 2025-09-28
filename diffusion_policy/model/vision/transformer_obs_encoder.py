@@ -11,8 +11,8 @@ import logging
 from diffusion_policy.model.common.module_attr_mixin import ModuleAttrMixin
 from diffusion_policy.common.pytorch_util import replace_submodules
 
-# Import the new function for MoE replacement
-from .moe_blocks import replace_ffn_with_moe 
+# Import the new function for MoE replacement 
+from .moe_blocks import replace_ffn_with_deepspeed_moe
 
 logger = logging.getLogger(__name__)
 
