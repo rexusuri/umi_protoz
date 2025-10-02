@@ -2,6 +2,8 @@ defaults:
   - _self_
   - task: umi
 
+local_rank: null
+
 name: train_diffusion_transformer_timm
 _target_: diffusion_policy.workspace.train_diffusion_transformer_timm_workspace.TrainDiffusionTransformerTimmWorkspace
 
@@ -38,7 +40,7 @@ policy:
 
     use_moe: true
     moe_layers: [8, 9, 10, 11]
-    moe_d_ffn: 3072  # 对于ViT-Base, 这个值是 d_model (768) 的4倍
+    # moe_d_ffn: 3072  # 对于ViT-Base, 这个值是 d_model (768) 的4倍
     moe_num_experts: 8
     moe_top_k: 2
     ##### from scratch #####
@@ -64,8 +66,11 @@ policy:
     downsample_ratio: 32
 
     transforms:
-      - type: RandomCrop
-        ratio: 0.95
+      - _target_: torchvision.transforms.RandomCrop
+        size: 213
+      - _target_: torchvision.transforms.Resize
+        size: [224, 224]
+        antialias: True # Recommended for better image quality
       - _target_: torchvision.transforms.RandomRotation
         degrees:
           - -5.0
@@ -139,6 +144,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 2000
+  deepspeed_config: ds_config.json
   num_epochs: 200
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm

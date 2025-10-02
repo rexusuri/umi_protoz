@@ -1,9 +1,10 @@
-# filename: moe_blocks.py (DeepSpeed Version)
+# filename: moe_blocks.py (DEFINITIVE WRAPPER Version)
 
+import torch
 import torch.nn as nn
 import deepspeed
 
-# 这是一个标准的FFN模块，我们将把它作为“专家”传递给DeepSpeed
+# This is the standard FFN module for the expert
 class FFN(nn.Module):
     def __init__(self, d_model, d_ffn):
         super().__init__()
@@ -14,31 +15,43 @@ class FFN(nn.Module):
     def forward(self, x):
         return self.linear2(self.activation(self.linear1(x)))
 
-# 这是我们的新替换函数
+# This wrapper makes the DeepSpeed MoE layer compatible with timm's ViT
+class DeepSpeedMoEWrapper(nn.Module):
+    def __init__(self, d_model, d_ffn, num_experts=8, top_k=2):
+        super().__init__()
+        # We create the actual DeepSpeed MoE layer inside this wrapper
+        expert = FFN(d_model=d_model, d_ffn=d_ffn)
+        self.moe_layer = deepspeed.moe.layer.MoE(
+            hidden_size=d_model,
+            expert=expert,
+            num_experts=num_experts,
+            k=top_k
+        )
+    
+    def forward(self, x):
+        # Call the MoE layer, which returns a tuple (output, loss, ...)
+        result = self.moe_layer(x)
+        
+        # IMPORTANT: We only return the FIRST element (the output tensor) to the timm block.
+        # The loss is handled automatically by the DeepSpeed engine in the background.
+        output = result[0]
+        
+        return output
+
 def replace_ffn_with_deepspeed_moe(model, layers_to_replace, num_experts=8, top_k=2):
     """
-    一个辅助函数，用于将指定ViT block的FFN (Mlp) 替换为 DeepSpeed MoE 层。
-    
-    注意：DeepSpeed MoE层会自动处理负载均衡损失，我们之后需要在训练脚本中获取它。
+    Replaces the FFN (Mlp) in specified ViT blocks with our DeepSpeedMoEWrapper.
     """
     for i in layers_to_replace:
         original_mlp = model.blocks[i].mlp
         d_model = original_mlp.fc1.in_features
         d_ffn = original_mlp.fc1.out_features
         
-        # 创建一个标准的FFN作为专家模板
-        expert = FFN(d_model=d_model, d_ffn=d_ffn)
-        
-        # 用DeepSpeed的MoE层替换原有的mlp属性
-        # hidden_size: 输入/输出特征维度
-        # expert: 传入一个专家模块的实例
-        # num_experts: 专家总数
-        # k: top_k路由
-        model.blocks[i].mlp = deepspeed.moe.layer.MoE(
-            hidden_size=d_model,
-            expert=expert,
+        # Replace the mlp attribute with our new wrapper class
+        model.blocks[i].mlp = DeepSpeedMoEWrapper(
+            d_model=d_model,
+            d_ffn=d_ffn,
             num_experts=num_experts,
-            k=top_k
+            top_k=top_k
         )
-        
     return model

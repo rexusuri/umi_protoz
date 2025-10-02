@@ -4,17 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, reduce
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers import DPMSolverMultistepScheduler
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.diffusion.transformer_for_action_diffusion import TransformerForActionDiffusion
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.vision.transformer_obs_encoder import TransformerObsEncoder
-# The MoEFeedForward import is no longer needed as we don't check for it manually
-# from diffusion_policy.model.vision.moe_blocks import MoEFeedForward
-
 
 class DiffusionTransformerTimmPolicy(BaseImagePolicy):
     def __init__(self, 
@@ -25,16 +22,13 @@ class DiffusionTransformerTimmPolicy(BaseImagePolicy):
             input_pertub=0.1,
             use_dpm_solver: bool = False,
             dpm_solver_order: int = 2,
-            # arch
             n_layer=7,
             n_head=8,
             n_emb=768,
             p_drop_attn=0.1,
-            # parameters passed to step
             **kwargs):
         super().__init__()
 
-        # This part of the initialization remains the same
         action_shape = shape_meta['action']['shape']
         assert len(action_shape) == 1
         action_dim = action_shape[0]
@@ -70,13 +64,11 @@ class DiffusionTransformerTimmPolicy(BaseImagePolicy):
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
     
-    # Inference methods (conditional_sample, predict_action) remain unchanged
     def conditional_sample(self, 
             condition_data, condition_mask,
             cond=None, generator=None,
             **kwargs
             ):
-        # ... (This method is unchanged)
         model = self.model
         scheduler = self.noise_scheduler
         if getattr(self, 'use_dpm_solver', False):
@@ -111,7 +103,6 @@ class DiffusionTransformerTimmPolicy(BaseImagePolicy):
         return trajectory
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        # ... (This method is unchanged)
         assert 'past_action' not in obs_dict
         nobs = self.normalizer.normalize(obs_dict)
         B = next(iter(nobs.values())).shape[0]
@@ -135,63 +126,35 @@ class DiffusionTransformerTimmPolicy(BaseImagePolicy):
         }
         return result
 
-    # ========= training methods modified for DeepSpeed ============
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
 
     def get_optimizer_params(self, optimizer_cfg: dict):
-        # This new method prepares the parameter groups for DeepSpeed,
-        # but does not create the optimizer object itself.
-        weight_decay = optimizer_cfg.get('weight_decay', 0)
-        obs_encoder_lr = optimizer_cfg.get('obs_encoder_lr', 1e-5)
-        obs_encoder_weight_decay = optimizer_cfg.get('obs_encoder_weight_decay', 0)
-
-        optim_groups = self.model.get_optim_groups(
-            weight_decay=weight_decay)
-        
-        backbone_params = list()
-        other_obs_params = list()
-        for key, value in self.obs_encoder.named_parameters():
-            if not value.requires_grad:
-                continue
-            if key.startswith('key_model_map'):
-                backbone_params.append(value)
-            else:
-                other_obs_params.append(value)
-        
-        optim_groups.append({
-            "params": backbone_params,
-            "weight_decay": obs_encoder_weight_decay,
-            "lr": obs_encoder_lr
-        })
-        optim_groups.append({
-            "params": other_obs_params,
-            "weight_decay": obs_encoder_weight_decay
-        })
-        
-        return optim_groups
+        # The simplified version is correct for letting DeepSpeed manage parameters.
+        return [p for p in self.parameters() if p.requires_grad]
 
     def compute_loss(self, batch):
-        # normalize input
         assert 'valid_mask' not in batch
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action'])
         trajectory = nactions
         
-        # process input
         obs_tokens = self.obs_encoder(nobs)
         
-        # Sample noise and timesteps
+        # Noise tensors are created as default float32, which is now correct
+        # for a non-FP16 run.
         noise = torch.randn(trajectory.shape, device=trajectory.device)
-        noise_new = noise + self.input_pertub * torch.randn(trajectory.shape, device=trajectory.device)
+        noise_new = noise + self.input_pertub * torch.randn(
+            trajectory.shape, device=trajectory.device)
+
         timesteps = torch.randint(
             0, self.noise_scheduler.config.num_train_timesteps, 
             (nactions.shape[0],), device=trajectory.device
         ).long()
+        
         noisy_trajectory = self.noise_scheduler.add_noise(
             trajectory, noise_new, timesteps)
         
-        # Predict the noise residual
         pred = self.model(
             noisy_trajectory,
             timesteps, 
@@ -206,22 +169,8 @@ class DiffusionTransformerTimmPolicy(BaseImagePolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
-        # compute the main diffusion loss
-        main_loss = F.mse_loss(pred, target, reduction='none')
-        main_loss = main_loss.type(main_loss.dtype)
-        main_loss = reduce(main_loss, 'b ... -> b (...)', 'mean')
-        main_loss = main_loss.mean()
-
-        # ===================================================================
-        # The manual auxiliary loss collection is REMOVED.
-        # DeepSpeed's MoE layer handles this automatically.
-        # The DeepSpeed engine will add the aux_loss to the main_loss
-        # before the backward pass. We just need to return the main_loss.
-        # ===================================================================
-
+        main_loss = F.mse_loss(pred, target)
         return main_loss
 
     def forward(self, batch):
-        # This now simply returns the main loss. DeepSpeed will wrap this call
-        # and automatically handle the auxiliary loss from its MoE layers.
         return self.compute_loss(batch)

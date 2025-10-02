@@ -1,3 +1,5 @@
+# filename: diffusion_policy/workspace/base_workspace.py (FINAL Corrected Version)
+
 from typing import Optional
 import os
 import pathlib
@@ -19,12 +21,23 @@ class BaseWorkspace:
         self._output_dir = output_dir
         self._saving_thread = None
 
+    # ===================================================================
+    # ====================  这里是唯一的修改点  =====================
+    # ===================================================================
     @property
     def output_dir(self):
-        output_dir = self._output_dir
-        if output_dir is None:
-            output_dir = HydraConfig.get().runtime.output_dir
-        return output_dir
+        if self._output_dir is not None:
+            return self._output_dir
+
+        # Fallback for when output_dir is not passed to __init__
+        try:
+            # First, try the standard @hydra.main way
+            return HydraConfig.get().runtime.output_dir
+        except ValueError:
+            # If that fails, it means we are in manual init mode.
+            # In that case, Hydra sets the current working dir to the output dir.
+            return os.getcwd()
+    # ===================================================================
     
     def run(self):
         """
